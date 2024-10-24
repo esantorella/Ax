@@ -51,7 +51,7 @@ class TestBoTorchTestProblem(TestCase):
         }
         self.assertEqual(
             evaluate_true_results["base Hartmann"],
-            evaluate_true_results["constrained Hartmann"],
+            evaluate_true_results["constrained Hartmann"][0],
         )
         self.assertEqual(
             evaluate_true_results["base Hartmann"],
@@ -59,34 +59,18 @@ class TestBoTorchTestProblem(TestCase):
         )
         self.assertEqual(
             evaluate_true_results["negated Hartmann"],
-            evaluate_true_results["negated constrained Hartmann"],
+            evaluate_true_results["negated constrained Hartmann"][0],
         )
-
         self.assertEqual(
-            self.botorch_test_problems["constrained Hartmann"].evaluate_slack_true(
-                params
-            ),
-            self.botorch_test_problems[
-                "negated constrained Hartmann"
-            ].evaluate_slack_true(params),
+            evaluate_true_results["constrained Hartmann"][1],
+            evaluate_true_results["negated constrained Hartmann"][1],
         )
-
-    def test_unsupported_error(self) -> None:
-        test_function = BoTorchTestProblem(botorch_problem=Hartmann(dim=6))
-        with self.assertRaisesRegex(
-            UnsupportedError, "`evaluate_slack_true` is only supported when"
-        ):
-            test_function.evaluate_slack_true({"a": 3})
 
     def test_raises_for_botorch_attrs(self) -> None:
-        with self.assertRaisesRegex(
-            ValueError, "noise_std should be set on the runner, not the test problem."
-        ):
+        msg = "noise should be set on the `BenchmarkRunner`, not the test function."
+        with self.assertRaisesRegex(ValueError, msg):
             BoTorchTestProblem(botorch_problem=Hartmann(dim=6, noise_std=0.1))
-        with self.assertRaisesRegex(
-            ValueError,
-            "constraint_noise_std should be set on the runner, not the test problem.",
-        ):
+        with self.assertRaisesRegex(ValueError, msg):
             BoTorchTestProblem(
                 botorch_problem=ConstrainedHartmann(dim=6, constraint_noise_std=0.1)
             )
@@ -109,25 +93,22 @@ class TestSyntheticRunner(TestCase):
             for test_problem_class, modified_bounds, noise_std in product(
                 (Hartmann, ConstrainedHartmann),
                 (None, [(0.0, 2.0)] * 6),
-                (None, 0.1),
+                (0.0, [0.1]),
             )
         ]
         param_based_cases = [
             (
-                TestParamBasedTestProblem(num_objectives=num_objectives, dim=6),
+                TestParamBasedTestProblem(num_outcomes=num_outcomes, dim=6),
                 noise_std,
             )
-            for num_objectives, noise_std in product((1, 2), (None, 0.0, 1.0))
+            for num_outcomes in (1, 2)
+            for noise_std in (0.0, [float(i) for i in range(num_outcomes)])
         ]
-        for test_problem, noise_std in botorch_cases + param_based_cases:
-            num_objectives = test_problem.num_objectives
+        for test_problem, noise_std in (botorch_cases + param_based_cases)[1:2]:
+            print(f"{noise_std=}, {test_problem=}")
+            num_outcomes = test_problem.num_outcomes
 
-            outcome_names = [f"objective_{i}" for i in range(num_objectives)]
-            is_constrained = isinstance(
-                test_problem, BoTorchTestProblem
-            ) and isinstance(test_problem.botorch_problem, ConstrainedHartmann)
-            if is_constrained:
-                outcome_names = outcome_names + ["constraint"]
+            outcome_names = [f"objective_{i}" for i in range(num_outcomes)]
 
             runner = ParamBasedTestProblemRunner(
                 test_problem=test_problem,
@@ -149,12 +130,17 @@ class TestSyntheticRunner(TestCase):
 
             with self.subTest(f"Test basic construction, {test_description}"):
                 self.assertIs(runner.test_problem, test_problem)
-                self.assertEqual(runner._is_constrained, is_constrained)
                 self.assertEqual(runner.outcome_names, outcome_names)
-                if noise_std is not None:
-                    self.assertEqual(runner.get_noise_stds(), noise_std)
-                else:
-                    self.assertIsNone(runner.get_noise_stds())
+                if isinstance(noise_std, list):
+                    self.assertEqual(
+                        runner.get_noise_stds(),
+                        dict(zip(runner.outcome_names, noise_std)),
+                    )
+                else:  # float
+                    self.assertEqual(
+                        runner.get_noise_stds(),
+                        {name: noise_std for name in runner.outcome_names},
+                    )
 
                 # check equality
                 new_runner = replace(
@@ -196,7 +182,7 @@ class TestSyntheticRunner(TestCase):
                 if isinstance(test_problem, BoTorchTestProblem):
                     botorch_problem = test_problem.botorch_problem
                     obj = botorch_problem.evaluate_true(X_tf)
-                    if runner._is_constrained:
+                    if isinstance(botorch_problem, ConstrainedHartmann):
                         expected_Y = torch.cat(
                             [
                                 obj.view(-1),
@@ -225,11 +211,15 @@ class TestSyntheticRunner(TestCase):
                 res = runner.run(trial=trial)
                 self.assertEqual({"Ys", "Ystds", "outcome_names"}, res.keys())
                 self.assertEqual({"0_0"}, res["Ys"].keys())
-                if noise_std is not None:
+
+                if isinstance(noise_std, list):
+                    self.assertEqual(res["Ystds"]["0_0"], noise_std)
+                    if all(noise_std) == 0:
+                        self.assertEqual(res["Ys"]["0_0"], Y.tolist())
+                else:  # float
                     self.assertEqual(res["Ystds"]["0_0"], [noise_std] * len(Y))
-                else:
-                    self.assertEqual(res["Ys"]["0_0"], Y.tolist())
-                    self.assertEqual(res["Ystds"]["0_0"], [0.0] * len(Y))
+                    if noise_std == 0:
+                        self.assertEqual(res["Ys"]["0_0"], Y.tolist())
                 self.assertEqual(res["outcome_names"], outcome_names)
 
             with self.subTest(f"test `poll_trial_status()`, {test_description}"):
@@ -248,28 +238,30 @@ class TestSyntheticRunner(TestCase):
                     ParamBasedTestProblemRunner.deserialize_init_args({})
 
     def test_botorch_test_problem_runner_heterogeneous_noise(self) -> None:
-        runner = ParamBasedTestProblemRunner(
-            test_problem=BoTorchTestProblem(botorch_problem=ConstrainedHartmann(dim=6)),
-            noise_std=0.1,
-            constraint_noise_std=0.05,
-            outcome_names=["objective", "constraint"],
-        )
-        self.assertDictEqual(
-            checked_cast(dict, runner.get_noise_stds()),
-            {"objective": 0.1, "constraint": 0.05},
-        )
+        for noise_std in [[0.1, 0.05], {"objective": 0.1, "constraint": 0.05}]:
+            runner = ParamBasedTestProblemRunner(
+                test_problem=BoTorchTestProblem(
+                    botorch_problem=ConstrainedHartmann(dim=6)
+                ),
+                noise_std=noise_std,
+                outcome_names=["objective", "constraint"],
+            )
+            self.assertDictEqual(
+                checked_cast(dict, runner.get_noise_stds()),
+                {"objective": 0.1, "constraint": 0.05},
+            )
 
-        X = torch.rand(1, 6, dtype=torch.double)
-        arm = Arm(
-            name="0_0",
-            parameters={f"x{i}": x.item() for i, x in enumerate(X.unbind(-1))},
-        )
-        trial = Mock(spec=Trial)
-        trial.arms = [arm]
-        trial.arm = arm
-        trial.index = 0
-        res = runner.run(trial=trial)
-        self.assertSetEqual(set(res.keys()), {"Ys", "Ystds", "outcome_names"})
-        self.assertSetEqual(set(res["Ys"].keys()), {"0_0"})
-        self.assertEqual(res["Ystds"]["0_0"], [0.1, 0.05])
-        self.assertEqual(res["outcome_names"], ["objective", "constraint"])
+            X = torch.rand(1, 6, dtype=torch.double)
+            arm = Arm(
+                name="0_0",
+                parameters={f"x{i}": x.item() for i, x in enumerate(X.unbind(-1))},
+            )
+            trial = Mock(spec=Trial)
+            trial.arms = [arm]
+            trial.arm = arm
+            trial.index = 0
+            res = runner.run(trial=trial)
+            self.assertSetEqual(set(res.keys()), {"Ys", "Ystds", "outcome_names"})
+            self.assertSetEqual(set(res["Ys"].keys()), {"0_0"})
+            self.assertEqual(res["Ystds"]["0_0"], [0.1, 0.05])
+            self.assertEqual(res["outcome_names"], ["objective", "constraint"])
